@@ -1,79 +1,79 @@
-使用 Tartarus.App；// ScanService, HintService, Hint (linked from the original app)
-使用 Tartarus.Rules;
-使用 Tartarus.Vision；
+using Tartarus.App;      // ScanService, HintService, Hint (linked from the original app)
+using Tartarus.Rules;
+using Tartarus.Vision;
 
-命名空间 塔耳塔罗斯安卓版;
+namespace TartarusAndroid;
 
 /// <summary>Two plain-text logs: answer.log (one line per answer) and error.log (everything that went wrong).</summary>
-静态的 班级 AppLog
+static class AppLog
 {
-静态的只读对象 Gate = 新();
-静态的 string _dir ="";
+    static readonly object Gate = new();
+    static string _dir = "";
 
-公共的、静态的、无效的 Init(string filesDir)
+    public static void Init(string filesDir)
     {
-_dir = System.IO.Path.Combine(filesDir，“日志”);
-Directory.CreateDirectory(_dir);
+        _dir = System.IO.Path.Combine(filesDir, "logs");
+        Directory.CreateDirectory(_dir);
     }
 
-静态的 string AnswerPath => System.IO.Path.Combine(_dir,
-静态的 string ErrorPath => System.IO.Path.Combine(_dir, “error.log”);
+    static string AnswerPath => System.IO.Path.Combine(_dir, "answer.log");
+    static string ErrorPath => System.IO.Path.Combine(_dir, "error.log");
 
-公共的、静态的、无效的。Answer(string text) => Append(AnswerPath, text.Replace('\n', ' '));
+    public static void Answer(string text) => Append(AnswerPath, text.Replace('\n', ' '));
 
-公共的 静态的 无效 Error(string where, Exception? ex = 无) =>
-        Append(ErrorPath, ex ==“{位置}：{ex.GetType().Name}：{ex.Message}\n{ex.StackTrace}” ？其中：$
+    public static void Error(string where, Exception? ex = null) =>
+        Append(ErrorPath, ex == null ? where : $"{where}: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
 
     /// <summary>The newest answer line (what the floating window shows).</summary>
-公共的、静态的字符串？LastAnswer()
+    public static string? LastAnswer()
     {
-        锁 （大门）
+        lock (Gate)
         {
-            尝试
+            try
             {
-                如果 (!File.Exists(AnswerPath))，则返回“无”；
-string? last = File.ReadLines(AnswerPath).LastOrDefault(l => l.Length >0);
-                如果 (last == 无) 返回
-                int i = last.IndexOf("] "，StringComparison.Ordinal）；
-                返回 i >=0? last[(i +2)..] : 最后；
+                if (!File.Exists(AnswerPath)) return null;
+                string? last = File.ReadLines(AnswerPath).LastOrDefault(l => l.Length > 0);
+                if (last == null) return null;
+                int i = last.IndexOf("] ", StringComparison.Ordinal);
+                return i >= 0 ? last[(i + 2)..] : last;
             }
-            抓住 { 返回 无; }
+            catch { return null; }
         }
     }
 
-公共的静态字符串ReadError(int maxChars =30000)
+    public static string ReadError(int maxChars = 30000)
     {
-        锁 （大门）
+        lock (Gate)
         {
-            尝试
+            try
             {
-                如果 (!File.Exists(ErrorPath)) 返回"（暂无报错）";
-string all = File.ReadAllText(ErrorPath);
-返回 all.Length <= maxChars? all : all[^maxChars..]；
+                if (!File.Exists(ErrorPath)) return "（暂无报错）";
+                string all = File.ReadAllText(ErrorPath);
+                return all.Length <= maxChars ? all : all[^maxChars..];
             }
-抓住 (异常 ex) { 返回"读取日志失败: "+ ex.Message; }
+            catch (Exception ex) { return "读取日志失败: " + ex.Message; }
         }
     }
 
-公共的、静态的、无效的ClearError()函数
+    public static void ClearError()
     {
-锁 (Gate) { 尝试 { File.Delete(ErrorPath); } 抓住 { } }
+        lock (Gate) { try { File.Delete(ErrorPath); } catch { } }
     }
 
-静态的 无效 Append(string path, string text)
+    static void Append(string path, string text)
     {
-        锁 （大门）
+        lock (Gate)
         {
-            尝试
+            try
             {
-File.AppendAllText路径, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n");
-如果（新的FileInfo(path)的长度大于512 *1024)
+                File.AppendAllText(path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n");
+                if (new FileInfo(path).Length > 512 * 1024)
                 {
-                    变量 线条 = File.ReadAllLines路径);
-                    File.WriteAllLines路径，lines.Skip(lines.Length /2));
+                    var lines = File.ReadAllLines(path);
+                    File.WriteAllLines(path, lines.Skip(lines.Length / 2));
                 }
             }
-            抓住 { }
+            catch { }
         }
     }
 }
@@ -83,64 +83,143 @@ File.AppendAllText路径, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}\n");
 /// Monte Carlo search ranks the moves, and the best one is worded for the Chinese client.
 /// Single shot: no run memory from the game's log, only the last Sandbox this engine itself read.
 /// </summary>
-密封的 班级 AnswerEngine : IDisposable
+sealed class AnswerEngine : IDisposable
 {
-    readonlyScanService _scans = 新(ocrThreads:4);
-只读HintService _hints = 新(playouts:512，秒数：2.0);
-    可编辑沙箱？_最后一块板子；
-塔耳塔罗斯。视觉。OCR。屏幕文本？_上一条文本；
+    readonly ScanService _scans = new(ocrThreads: 4);
+    readonly HintService _hints = new(playouts: 512, seconds: 2.0);
+    EditableSandbox? _lastBoard;
+    Tartarus.Vision.Ocr.ScreenText? _lastText;
 
-公共的 AnswerEngine() => _scans.SetGameLanguage(“zh”);
+    public AnswerEngine() => _scans.SetGameLanguage("zh");
 
-公共的静态函数 Frame：MakeFrame(int宽度, int高度, byte[] rgba) =>
-新（宽度，高度，rgba，Tartarus.Vision.PixelFormat.Rgba32）；
+    public static Frame MakeFrame(int width, int height, byte[] rgba) =>
+        new(width, height, rgba, Tartarus.Vision.PixelFormat.Rgba32);
 
-公共的 Task WarmUpAsync() => _scans.WarmUpAsync();
+    public Task WarmUpAsync() => _scans.WarmUpAsync();
 
-公共的异步Task<string> SolveAsync(Frame frame)
+    public async Task<string> SolveAsync(Frame frame)
     {
-        ScanResult r = await_scans.ScanAsync(frame);
-        如果 (_scans.Problem
+        ScanResult r = await _scans.ScanAsync(frame);
+        if (_scans.Problem is { } problem)
         {
-{ }问题）"识别器启动失败: "+ 问题）；
-            返回 "识别器启动失败";
+            AppLog.Error("识别器启动失败: " + problem);
+            return "识别器启动失败";
         }
-        如果 (!r.Ok && r.Pick == 无)
+        if (!r.Ok && r.Pick == null)
         {
-AppLog.Error($“未检测到棋盘或选择界面（原因：{r.Reason}；截图尺寸 {frame.Width}x{frame.Height}）”);
-            返回 "未识别到棋盘";
+            AppLog.Error($"没有识别到棋盘或选择界面 (原因: {r.Reason}; 截图 {frame.Width}x{frame.Height})");
+            return "未识别到棋盘";
         }
 
-观测值 obs；
-        bool consumeOnly = 假；
-        PickRead? pick = 无;
-如果 (r.Ok)
+        Observation obs;
+        bool consumeOnly = false;
+        PickRead? pick = null;
+        if (r.Ok)
         {
-变量 sb = EditableSandbox.FromScan(r);
-// 那个红色的“选择要吃谁”的界面会破坏画面的完整性：之前正常的画面内容会被它取代。
-            consumeOnly = r.Text?.ConsumePick == 真实;
-            如果（仅消费且 _lastBoard 不等于 无）
+            var sb = EditableSandbox.FromScan(r);
+            // The red "choose who to eat" screen spoils the panels: what the last normal screen showed stands in.
+            consumeOnly = r.Text?.ConsumePick == true;
+            if (consumeOnly && _lastBoard != null)
             {
-sb.Instruments = [.. _lastBoard.Instruments];
-sb.Chromatic = _lastBoard.Chromatic;
-sb.Theme = _lastBoard.Theme?? sb.Theme;
-sb.Days??= _lastBoard.Days;
+                sb.Instruments = [.. _lastBoard.Instruments];
+                sb.Chromatic = _lastBoard.Chromatic;
+                sb.Theme = _lastBoard.Theme ?? sb.Theme;
+                sb.Days ??= _lastBoard.Days;
             }
-            否则
+            else
             {
-                sb.Theme??= r.ThemeIcon;
+                sb.Theme ??= r.ThemeIcon;
             }
-sb.MarksByInstruments();
-变量 文本 = consumeOnly? _lastText?? r.Text : r.Text;
-obs = GameObservation.From(sb, text);
-            如果 (!仅消费)
+            sb.MarksByInstruments();
+            var text = consumeOnly ? _lastText ?? r.Text : r.Text;
+            obs = GameObservation.From(sb, text);
+            if (!consumeOnly)
             {
-_lastBoard = sb克隆();
-_lastText = r.Text;
+                _lastBoard = sb.Clone();
+                _lastText = r.Text;
             }
         }
-        否则
+        else
         {
             pick = r.Pick!;
-变量 under = _lastBoard?.Clone()?? EditableSandbox.Empty();
-            // 一条指令
+            var under = _lastBoard?.Clone() ?? EditableSandbox.Empty();
+            // An instrument pick with no day on the board is a new run's first pick.
+            if (pick.Kind == PickRead.Instrument && (under.Days == null || under.Days == 0))
+            {
+                string? theme = _lastBoard?.Theme;
+                under = EditableSandbox.Empty();
+                under.Theme = theme;
+            }
+            obs = GameObservation.FromPick(pick, under, _lastText);
+        }
+
+        var tcs = new TaskCompletionSource<Hint>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnReady(Hint h) => tcs.TrySetResult(h);
+        _hints.Ready += OnReady;
+        try
+        {
+            _hints.Clear();   // the same position again must be searched again
+            _hints.Request(obs, consumeOnly);
+            var done = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(_hints.Seconds + 8)));
+            if (done != tcs.Task) return "没有算出建议";
+            return Describe(tcs.Task.Result, pick);
+        }
+        finally
+        {
+            _hints.Ready -= OnReady;
+        }
+    }
+
+    static string Describe(Hint h, PickRead? pick)
+    {
+        var ranked = h.Ranked;
+        if (ranked.Count == 0) return "没有可选操作";
+        var best = ranked[0];
+        return Step(best.Action, h, pick) + $"（预期绮彩≈{best.Chromatic:0.0}）";
+    }
+
+    /// <summary>A move in the Chinese client's words. Cells: the rules count from 0, the screen from 1.</summary>
+    static string Step(GameAction a, Hint h, PickRead? pick)
+    {
+        int cell = a.Arg + 1;
+        switch (a.Kind)
+        {
+            case ActionKind.Move: return $"去{cell}号";
+            case ActionKind.Ratway: return $"下水道：去{cell}号";
+            case ActionKind.Consume: return h.ConsumeOnly ? $"吃{cell}号囚犯" : $"点「吃」，目标{cell}号";
+            case ActionKind.Chain: return $"连吃{cell}号囚犯";
+            case ActionKind.StopChain: return "点「取消」，不再吃";
+            case ActionKind.Replace: return "点「换」";
+            case ActionKind.End: return "点「结束」";
+            case ActionKind.Hunt: return h.HuntOnly ? $"猎{cell}号囚犯" : $"点「猎」，目标{cell}号";
+            case ActionKind.Reroll: return "点重新抽取";
+            case ActionKind.Interrogate: return a.Arg == 0 ? "审讯室：煽动" : "审讯室：赐予";
+            case ActionKind.PickTreasure:
+            {
+                var wanted = (Treasure)a.Arg;
+                int i = pick?.Cards.FindIndex(c => GameObservation.Treasure(c.Id) == wanted) ?? -1;
+                string name = wanted switch
+                {
+                    Treasure.ThumbRing => "三首扳指",
+                    Treasure.BrassHorn => "斗争铜号",
+                    Treasure.CrimsonVintage => "赤色佳酿",
+                    _ => "原罪烙印",
+                };
+                return i >= 0 ? $"选第{i + 1}张「{name}」" : $"选「{name}」";
+            }
+            case ActionKind.PickInstrument:
+            {
+                var wanted = (Instrument)a.Arg;
+                int i = pick?.Cards.FindIndex(c => c.Id != null && GameData.InstrumentById(c.Id) == wanted) ?? -1;
+                return i >= 0 ? $"选第{i + 1}张刑具（{wanted}）" : $"选刑具 {wanted}";
+            }
+            default: return a.Kind.ToString();
+        }
+    }
+
+    public void Dispose()
+    {
+        _hints.Dispose();
+        _scans.Dispose();
+    }
+}
