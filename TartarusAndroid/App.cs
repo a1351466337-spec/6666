@@ -1,9 +1,9 @@
-using System.Diagnostics;
 using Android.App;
 using Android.Content;
 using Android.Content.PM;
 using Android.Graphics;
 using Android.Graphics.Drawables;
+using Android.Hardware.Display;
 using Android.Media;
 using Android.Media.Projection;
 using Android.OS;
@@ -455,9 +455,9 @@ public class FloatingService : Service
         _userMoved = false;
     }
 
-    public override void OnConfigurationChanged(Android.Content.Res.Configuration newConfig)
+    public override void OnConfigurationChanged(Android.Content.Res.Configuration? newConfig)
     {
-        base.OnConfigurationChanged(newConfig);
+        base.OnConfigurationChanged(newConfig!);
         if (_ball == null || !_ballAdded) return;
         var (w, h, _) = ScreenGrabber.Metrics(this);
         if (!_userMoved) CenterBall();
@@ -548,7 +548,7 @@ public class FloatingService : Service
             Cloak(true);                       // the overlay would be in the screenshot (and in the OCR)
             _grabber.FollowScreenSize();
             long seq = _grabber.Seq;
-            var sw = Stopwatch.StartNew();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             await Task.Delay(200);
             while (_grabber.Seq < seq + 2 && sw.ElapsedMilliseconds < 1500) await Task.Delay(30);
             var frame = _grabber.Grab();

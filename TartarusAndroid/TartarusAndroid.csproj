@@ -21,6 +21,16 @@
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
+  <!-- Android's implicit usings clash with the original code's names (GameState, ...): none of them. -->
+  <ItemGroup>
+    <Using Remove="Android.App" />
+    <Using Remove="Android.Content" />
+    <Using Remove="Android.OS" />
+    <Using Remove="Android.Runtime" />
+    <Using Remove="Android.Views" />
+    <Using Remove="Android.Widget" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="../upstream/src/Tartarus.Rules/Tartarus.Rules.csproj" />
     <ProjectReference Include="../upstream/src/Tartarus.Solver/Tartarus.Solver.csproj" />
