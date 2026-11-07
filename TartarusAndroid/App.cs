@@ -36,8 +36,8 @@ public class MainActivity : Activity
         AppLog.Init(FilesDir!.AbsolutePath);
         float d = Resources!.DisplayMetrics!.Density;
 
-        var root = new LinearLayout(this) { Orientation = Orientation.Vertical };
-        root.FitsSystemWindows = true;
+        var root = new LinearLayout(this) { Orientation = Android.Widget.Orientation.Vertical };
+        root.SetFitsSystemWindows(true);
         root.SetPadding((int)(16 * d), (int)(16 * d), (int)(16 * d), 0);
 
         _status = new TextView(this) { Text = "点「开启悬浮球」，授权截屏后，悬浮球会出现在屏幕中央。\n单击：截屏分析；双击：隐藏；长按：拖动。\n隐藏后可从通知栏的「显示悬浮球」找回。" };
@@ -109,11 +109,11 @@ public class LogActivity : Activity
     {
         base.OnCreate(savedInstanceState);
         float d = Resources!.DisplayMetrics!.Density;
-        var root = new LinearLayout(this) { Orientation = Orientation.Vertical };
-        root.FitsSystemWindows = true;
+        var root = new LinearLayout(this) { Orientation = Android.Widget.Orientation.Vertical };
+        root.SetFitsSystemWindows(true);
         root.SetPadding((int)(12 * d), (int)(12 * d), (int)(12 * d), (int)(12 * d));
 
-        var bar = new LinearLayout(this) { Orientation = Orientation.Horizontal };
+        var bar = new LinearLayout(this) { Orientation = Android.Widget.Orientation.Horizontal };
         var title = new TextView(this) { Text = "报错日志" };
         title.TextSize = 18;
         bar.AddView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WrapContent, 1f));
