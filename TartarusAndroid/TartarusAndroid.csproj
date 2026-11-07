@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup>
+                  Link="Assets/models/%(RecursiveDir)%(Filename)%(Extension)" />
+<输出类型>Exe</输出类型>
+<SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
+<RootNamespace>TartarusAndroid</RootNamespace>
+<AssemblyName>TartarusAndroid</AssemblyName>
+<ApplicationId>com.tartarus.helper</ApplicationId>
+<ApplicationVersion>1</ApplicationVersion>
+<ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
+<Nullable>启用</Nullable>
+<ImplicitUsings>启用</ImplicitUsings>
+<LangVersion>最新版本</LangVersion>
+<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+<RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+<AndroidPackageFormat>apk</AndroidPackageFormat>
+<EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
+<PublishTrimmed>false</PublishTrimmed>
+<AndroidLinkMode>无</AndroidLinkMode>
+<RunAOTCompilation>false</RunAOTCompilation>
+<TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+</PropertyGroup>
+
+<!-- 原始应用程序的视觉规则以及求解器，保持原有状态（由工作流复制到../upstream目录中）。-->
+  <ItemGroup>
+<ProjectReference Include="../upstream/src/Tartarus.Rules/Tartarus.Rules.csproj" />
+<ProjectReference Include="../upstream/src/Tartarus.Solver/Tartarus.Solver.csproj" />
+<ProjectReference Include="../upstream/src/Tartarus.Vision/Tartarus.Vision.csproj" />
+</ItemGroup>
+
+<!-- 原WPF应用中的两个普通类（不包含任何用户界面功能）：扫描线程与移动搜索模块。 -->
+  <ItemGroup>
+<Compile Include="../upstream/src/Tartarus.App/ScanService.cs" Link="Upstream/ScanService.cs" />
+<Compile Include="../upstream/src/Tartarus.App/HintService.cs" Link="Upstream/HintService.cs" />
+</ItemGroup>
+
+<!-- 这些模型（网络结构、图片、文本，以及中英文OCR功能）都存储在APK文件中，会在首次启动时被解压出来。-->
+  <ItemGroup>
+<AndroidAsset Include="../upstream/models/**/*"
+排除：“../upstream/models/ocr/*eslav*；../upstream/models/ocr/*korean*；../upstream/models/ocr/*thai*；../upstream/models/ocr/*latin*”
+                  Link="Assets/models/%(RecursiveDir)%(Filename)%(Extension)" />
+</ItemGroup>
+</项目>
