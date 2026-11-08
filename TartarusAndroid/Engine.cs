@@ -105,9 +105,11 @@ sealed class AnswerEngine : IDisposable
             AppLog.Error("识别器启动失败: " + problem);
             return "识别器启动失败";
         }
-        if (!r.Ok && r.Pick == null)
+        // The red "choose who to eat" screen: seen by its red glow at both sides, whatever the OCR made of its words.
+        bool red = LooksRed(frame);
+        if (!r.Ok && r.Pick == null && !(red && _lastBoard != null))
         {
-            AppLog.Error($"没有识别到棋盘或选择界面 (原因: {r.Reason}; 截图 {frame.Width}x{frame.Height})");
+            AppLog.Error($"没有识别到棋盘或选择界面 (原因: {r.Reason}; 截图 {frame.Width}x{frame.Height}; 红屏={red})");
             return "未识别到棋盘";
         }
 
@@ -117,8 +119,8 @@ sealed class AnswerEngine : IDisposable
         if (r.Ok)
         {
             var sb = EditableSandbox.FromScan(r);
-            // The red "choose who to eat" screen spoils the panels: what the last normal screen showed stands in.
-            consumeOnly = r.Text?.ConsumePick == true;
+            // The red screen spoils the panels: what the last normal screen showed stands in.
+            consumeOnly = r.Text?.ConsumePick == true || red;
             if (consumeOnly && _lastBoard != null)
             {
                 sb.Instruments = [.. _lastBoard.Instruments];
@@ -133,15 +135,28 @@ sealed class AnswerEngine : IDisposable
             sb.MarksByInstruments();
             var text = consumeOnly ? _lastText ?? r.Text : r.Text;
             obs = GameObservation.From(sb, text);
+            // The cards' own words (Chinese client): which of Consume / Replace / End are still there today.
+            if (!consumeOnly && !obs.Interrogation && obs.Destinations.Count == 0 && r.Text is { } t)
+            {
+                var labels = t.Cards.Select(c => c.Text).ToList();
+                bool eat = labels.Any(x => x.Contains('吃') || x.Contains('猎'));
+                bool swap = labels.Any(x => x.Contains('换') || x.Contains('換'));
+                bool end = labels.Any(x => x.Contains("结束") || x.Contains("結束"));
+                if (eat || swap || end)
+                {
+                    obs.DecisionUsed = !eat;
+                    obs.ReplaceUsed = !swap;
+                }
+            }
             if (!consumeOnly)
             {
                 _lastBoard = sb.Clone();
                 _lastText = r.Text;
             }
         }
-        else
+        else if (r.Pick != null)
         {
-            pick = r.Pick!;
+            pick = r.Pick;
             var under = _lastBoard?.Clone() ?? EditableSandbox.Empty();
             // An instrument pick with no day on the board is a new run's first pick.
             if (pick.Kind == PickRead.Instrument && (under.Days == null || under.Days == 0))
@@ -152,6 +167,16 @@ sealed class AnswerEngine : IDisposable
             }
             obs = GameObservation.FromPick(pick, under, _lastText);
         }
+        else
+        {
+            // Red screen the scanner could not read as a Sandbox: the Sandbox stands still under it, use the last one.
+            consumeOnly = true;
+            var sb = _lastBoard!.Clone();
+            sb.MarksByInstruments();
+            obs = GameObservation.From(sb, _lastText);
+        }
+
+        AppLog.Error("[调试] " + Diag(r, obs, consumeOnly, red));
 
         var tcs = new TaskCompletionSource<Hint>(TaskCreationOptions.RunContinuationsAsynchronously);
         void OnReady(Hint h) => tcs.TrySetResult(h);
@@ -162,12 +187,49 @@ sealed class AnswerEngine : IDisposable
             _hints.Request(obs, consumeOnly);
             var done = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(_hints.Seconds + 8)));
             if (done != tcs.Task) return "没有算出建议";
-            return Describe(tcs.Task.Result, pick);
+            var hint = tcs.Task.Result;
+            AppLog.Error("[调试] 排名: " + string.Join(" | ", hint.Ranked.Take(5).Select(a => $"{Step(a.Action, hint, pick)}={a.Mean:0.00}")));
+            return Describe(hint, pick);
         }
         finally
         {
             _hints.Ready -= OnReady;
         }
+    }
+
+    /// <summary>Strong red at both sides of the screen: the Consume target pick's glow.</summary>
+    static bool LooksRed(Frame f)
+    {
+        double Share(double x0, double x1)
+        {
+            int total = 0, red = 0;
+            int ya = (int)(f.Height * 0.15), yb = (int)(f.Height * 0.60);
+            for (int y = ya; y < yb; y += 6)
+                for (int x = (int)(f.Width * x0); x < (int)(f.Width * x1); x += 6)
+                {
+                    int i = (y * f.Width + x) * 4;
+                    int pr = f.Pixels[i], pg = f.Pixels[i + 1], pb = f.Pixels[i + 2];
+                    total++;
+                    if (pr > 110 && pg < pr * 0.45 && pb < pr * 0.45) red++;
+                }
+            return total == 0 ? 0 : (double)red / total;
+        }
+        return Share(0.10, 0.26) > 0.08 && Share(0.74, 0.90) > 0.08;
+    }
+
+    /// <summary>One line for the error log: what the scanner read, to find out why a hint is off.</summary>
+    static string Diag(ScanResult r, Observation obs, bool consumeOnly, bool red)
+    {
+        string cards = r.Text == null ? "" : string.Join(",", r.Text.Cards.Select(c => $"{c.Kind ?? "?"}/{c.Text}"));
+        string banner = r.Text != null && r.Text.ByRole.TryGetValue("banner", out var b) ? string.Join("|", b.Select(l => l.Text)) : "";
+        string cells = string.Join(" ", Enumerable.Range(1, 15).Select(i =>
+        {
+            var c = obs.Cells[i];
+            return $"{i + 1}:{c.Kind.ToString()[0]}" + (c.Kind == ObservedKind.Inmate ? $"{c.Code.ToString()[0]}{(int)c.Rarity}" : "");
+        }));
+        return $"ok={r.Ok} pick={r.Pick?.Kind} red={red} consumeOnly={consumeOnly} days={obs.RemainingDays} warden={obs.Warden} " +
+               $"chroma={obs.Chromatic} inst={obs.Instruments.Count} dest={obs.Destinations.Count} interro={obs.Interrogation} " +
+               $"decUsed={obs.DecisionUsed} repUsed={obs.ReplaceUsed} title={r.Text?.Title} banner={banner} cards={cards} cells={cells}";
     }
 
     static string Describe(Hint h, PickRead? pick)
@@ -205,13 +267,15 @@ sealed class AnswerEngine : IDisposable
                     Treasure.CrimsonVintage => "赤色佳酿",
                     _ => "原罪烙印",
                 };
+                if (i >= 0 && !string.IsNullOrWhiteSpace(pick!.Cards[i].Text)) name = pick.Cards[i].Text;
                 return i >= 0 ? $"选第{i + 1}张「{name}」" : $"选「{name}」";
             }
             case ActionKind.PickInstrument:
             {
                 var wanted = (Instrument)a.Arg;
                 int i = pick?.Cards.FindIndex(c => c.Id != null && GameData.InstrumentById(c.Id) == wanted) ?? -1;
-                return i >= 0 ? $"选第{i + 1}张刑具（{wanted}）" : $"选刑具 {wanted}";
+                string label = i >= 0 && !string.IsNullOrWhiteSpace(pick!.Cards[i].Text) ? pick.Cards[i].Text : wanted.ToString();
+                return i >= 0 ? $"选第{i + 1}张刑具「{label}」" : $"选刑具 {label}";
             }
             default: return a.Kind.ToString();
         }

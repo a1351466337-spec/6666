@@ -604,7 +604,7 @@ public class FloatingService : Service
         if (!_answerAdded) { _wm.AddView(_answer, _answerLp); _answerAdded = true; }
         else _wm.UpdateViewLayout(_answer, _answerLp);
         _handler.RemoveCallbacks(_hideAnswer);
-        _handler.PostDelayed(_hideAnswer, 25000);
+        _handler.PostDelayed(_hideAnswer, 10000);
     }
 
     public override void OnDestroy()
