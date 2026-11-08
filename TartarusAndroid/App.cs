@@ -40,7 +40,7 @@ public class MainActivity : Activity
         root.SetFitsSystemWindows(true);
         root.SetPadding((int)(16 * d), (int)(16 * d), (int)(16 * d), 0);
 
-        _status = new TextView(this) { Text = "点「开启悬浮球」，授权截屏后，悬浮球会出现在屏幕中央。\n单击：截屏分析；双击：隐藏；长按：拖动。\n隐藏后可从通知栏的「显示悬浮球」找回。" };
+        _status = new TextView(this) { Text = "点「开启悬浮球」，授权截屏后，悬浮球会出现在屏幕中央。\n单击：马上分析；双击：隐藏；长按后拖动。\n打开「实时分析」后，画面一变就自动分析（球变绿，显示“实”）；也可以在通知栏里开关。\n隐藏后可从通知栏的「显示悬浮球」找回。" };
         _status.TextSize = 15;
         root.AddView(_status);
 
@@ -51,6 +51,21 @@ public class MainActivity : Activity
         var stop = new Button(this) { Text = "关闭悬浮球" };
         stop.Click += (_, _) => StopService(new Intent(this, typeof(FloatingService)));
         root.AddView(stop);
+
+        var live = new Switch(this) { Text = "实时分析（画面变化后自动分析）" };
+        live.Checked = Prefs.Live(this);
+        live.CheckedChange += (_, e) =>
+        {
+            Prefs.SetLive(this, e.IsChecked);
+            if (FloatingService.Running)
+            {
+                var i = new Intent(this, typeof(FloatingService));
+                i.SetAction(FloatingService.ActionLive);
+                i.PutExtra("on", e.IsChecked);
+                StartService(i);
+            }
+        };
+        root.AddView(live);
 
         root.AddView(new View(this), new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, 0, 1f));
 
@@ -296,6 +311,42 @@ sealed class ScreenGrabber : IDisposable
         }
     }
 
+    public const int SigW = 64, SigH = 28;
+
+    /// <summary>
+    /// A 64x28 grey thumbnail of the newest frame (a few rows read, not the whole frame), to tell whether the screen
+    /// changed. The rectangles (the ball, the answer window) are left out.
+    /// </summary>
+    public byte[]? Signature(List<(int X0, int Y0, int X1, int Y1)> masks)
+    {
+        lock (_gate)
+        {
+            if (_latest == null) return null;
+            var plane = _latest.GetPlanes()![0];
+            var buf = plane.Buffer!;
+            int w = _latest.Width, h = _latest.Height, rowStride = plane.RowStride, px = plane.PixelStride;
+            var sig = new byte[SigW * SigH];
+            var row = new byte[w * px];
+            for (int sy = 0; sy < SigH; sy++)
+            {
+                int y = (sy * 2 + 1) * h / (SigH * 2);
+                buf.Position(y * rowStride);
+                buf.Get(row, 0, Math.Min(row.Length, buf.Remaining()));
+                for (int sx = 0; sx < SigW; sx++)
+                {
+                    int x = (sx * 2 + 1) * w / (SigW * 2);
+                    bool masked = false;
+                    foreach (var m in masks)
+                        if (x >= m.X0 && x < m.X1 && y >= m.Y0 && y < m.Y1) { masked = true; break; }
+                    if (masked) continue;
+                    int i = x * px;
+                    if (i + 2 < row.Length) sig[sy * SigW + sx] = (byte)((row[i] + row[i + 1] * 2 + row[i + 2]) / 4);
+                }
+            }
+            return sig;
+        }
+    }
+
     public void Dispose()
     {
         try { _display?.Release(); } catch { }
@@ -310,19 +361,33 @@ sealed class ScreenGrabber : IDisposable
 //   tap: screenshot + answer | double tap: hide the ball | long press, then drag: move it
 //   the ball starts in the middle of the screen every time the service starts
 // ------------------------------------------------------------------------------------------------
+static class Prefs
+{
+    static ISharedPreferences P(Context c) => c.GetSharedPreferences("tartarus", FileCreationMode.Private)!;
+    public static bool Live(Context c) => P(c).GetBoolean("live", false);
+    public static void SetLive(Context c, bool on) => P(c).Edit()!.PutBoolean("live", on)!.Apply();
+}
+
 [Service(Exported = false, ForegroundServiceType = ForegroundService.TypeMediaProjection)]
 public class FloatingService : Service
 {
-    public const string ActionStart = "tartarus.START", ActionShow = "tartarus.SHOW", ActionQuit = "tartarus.QUIT";
+    public const string ActionStart = "tartarus.START", ActionShow = "tartarus.SHOW", ActionQuit = "tartarus.QUIT", ActionLive = "tartarus.LIVE";
+    public static volatile bool Running;
     const string ChannelId = "tartarus_ball";
+    const int ChangeCount = 22;   // of the 64x28 samples, this many changing strongly = the screen changed
+    const int SettleCount = 8;    // fewer than this changing between two looks = the screen has settled
 
     readonly Handler _handler = new(Looper.MainLooper!);
     IWindowManager _wm = null!;
     TextView? _ball, _answer;
+    GradientDrawable? _ballBg;
     WindowManagerLayoutParams? _ballLp, _answerLp;
-    bool _ballAdded, _answerAdded, _busy, _dragging, _moved, _tapPending, _userMoved;
+    bool _ballAdded, _answerAdded, _busy, _dragging, _moved, _tapPending, _userMoved, _live;
     float _density, _downX, _downY;
-    int _size, _slop, _startX, _startY;
+    int _size, _slop, _startX, _startY, _noBoardStreak;
+    string _lastAnswer = "";
+    DateTime _lastShot = DateTime.MinValue;
+    CancellationTokenSource? _liveCts;
     Java.Lang.Runnable _longPress = null!, _singleTap = null!, _hideAnswer = null!;
     ScreenGrabber? _grabber;
     AnswerEngine? _engine;
@@ -333,14 +398,16 @@ public class FloatingService : Service
     public override void OnCreate()
     {
         base.OnCreate();
+        Running = true;
         AppLog.Init(FilesDir!.AbsolutePath);
+        _live = Prefs.Live(this);
         _wm = GetSystemService(WindowService)!.JavaCast<IWindowManager>();
         _density = Resources!.DisplayMetrics!.Density;
         _size = (int)(56 * _density);
         _slop = (int)(8 * _density);
         _longPress = new Java.Lang.Runnable(BeginDrag);
         _singleTap = new Java.Lang.Runnable(() => { _tapPending = false; OnSingleTap(); });
-        _hideAnswer = new Java.Lang.Runnable(() => { if (_answer != null) _answer.Visibility = ViewStates.Gone; });
+        _hideAnswer = new Java.Lang.Runnable(HideAnswer);
     }
 
     public override StartCommandResult OnStartCommand(Intent? intent, StartCommandFlags flags, int startId)
@@ -352,6 +419,9 @@ public class FloatingService : Service
                 break;
             case ActionShow:
                 ShowBall(center: false);
+                break;
+            case ActionLive:
+                SetLive(intent.HasExtra("on") ? intent.GetBooleanExtra("on", false) : !_live);
                 break;
             case ActionStart:
                 StartAsForeground();
@@ -373,6 +443,7 @@ public class FloatingService : Service
                 }
                 ShowBall(center: true);
                 Task.Run(InitEngine);
+                if (_live) StartLive();
                 break;
         }
         return StartCommandResult.NotSticky;
@@ -395,25 +466,126 @@ public class FloatingService : Service
         }
     }
 
-    // ---------- notification (keeps the service alive; brings the ball back) ----------
+    // ---------- notification (keeps the service alive; brings the ball back; switches the live mode) ----------
+    Notification BuildNotification()
+    {
+        var icon = Android.Graphics.Drawables.Icon.CreateWithResource(this, Android.Resource.Drawable.IcMenuView)!;
+        PendingIntent Act(int code, string action) => PendingIntent.GetService(this, code,
+            new Intent(this, typeof(FloatingService)).SetAction(action),
+            PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent)!;
+        return new Notification.Builder(this, ChannelId)
+            .SetContentTitle(_live ? "塔罗斯助手：实时分析中" : "塔罗斯助手运行中")
+            .SetContentText("悬浮球被隐藏时，点「显示悬浮球」")
+            .SetSmallIcon(Android.Resource.Drawable.IcMenuView)!
+            .AddAction(new Notification.Action.Builder(icon, "显示悬浮球", Act(1, ActionShow)).Build())!
+            .AddAction(new Notification.Action.Builder(icon, _live ? "关闭实时分析" : "开启实时分析", Act(3, ActionLive)).Build())!
+            .AddAction(new Notification.Action.Builder(icon, "退出", Act(2, ActionQuit)).Build())!
+            .Build()!;
+    }
+
     void StartAsForeground()
     {
         var nm = GetSystemService(NotificationService)!.JavaCast<NotificationManager>();
         nm.CreateNotificationChannel(new NotificationChannel(ChannelId, "悬浮球", NotificationImportance.Low));
-        var show = PendingIntent.GetService(this, 1, new Intent(this, typeof(FloatingService)).SetAction(ActionShow),
-            PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent)!;
-        var quit = PendingIntent.GetService(this, 2, new Intent(this, typeof(FloatingService)).SetAction(ActionQuit),
-            PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent)!;
-        var icon = Android.Graphics.Drawables.Icon.CreateWithResource(this, Android.Resource.Drawable.IcMenuView)!;
-        var n = new Notification.Builder(this, ChannelId)
-            .SetContentTitle("塔罗斯助手运行中")
-            .SetContentText("悬浮球被隐藏时，点下面的「显示悬浮球」")
-            .SetSmallIcon(Android.Resource.Drawable.IcMenuView)!
-            .AddAction(new Notification.Action.Builder(icon, "显示悬浮球", show).Build())!
-            .AddAction(new Notification.Action.Builder(icon, "退出", quit).Build())!
-            .Build()!;
+        var n = BuildNotification();
         if (Build.VERSION.SdkInt >= BuildVersionCodes.Q) StartForeground(1, n, ForegroundService.TypeMediaProjection);
         else StartForeground(1, n);
+    }
+
+    void RefreshNotification()
+    {
+        try
+        {
+            var nm = GetSystemService(NotificationService)!.JavaCast<NotificationManager>();
+            nm.Notify(1, BuildNotification());
+        }
+        catch { }
+    }
+
+    // ---------- live mode ----------
+    void SetLive(bool on)
+    {
+        _live = on;
+        Prefs.SetLive(this, on);
+        UpdateBallLook();
+        RefreshNotification();
+        if (on) StartLive(); else StopLive();
+        Toast.MakeText(this, on ? "实时分析：开" : "实时分析：关", ToastLength.Short)!.Show();
+    }
+
+    void StartLive()
+    {
+        StopLive();
+        _liveCts = new CancellationTokenSource();
+        _ = LiveLoop(_liveCts.Token);
+    }
+
+    void StopLive()
+    {
+        _liveCts?.Cancel();
+        _liveCts = null;
+    }
+
+    static int CountDiff(byte[] a, byte[] b)
+    {
+        int n = 0;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != 0 && b[i] != 0 && Math.Abs(a[i] - b[i]) > 36) n++;
+        return n;
+    }
+
+    /// <summary>
+    /// Looks at the screen every 0.3 s (a thumbnail, cheap). When it has changed since the last analysed screen and has
+    /// settled (the game's own animations are small changes), it analyses it. Other apps' screens back off.
+    /// </summary>
+    async Task LiveLoop(CancellationToken ct)
+    {
+        byte[]? analyzed = null, prev = null;
+        bool pending = true;
+        int stable = 0, waited = 0;
+        var lastRun = DateTime.MinValue;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(300, ct);
+                if (_busy || !_ready || _grabber == null || _ball == null || _ball.Visibility == ViewStates.Gone) continue;
+                var sig = _grabber.Signature(MaskRects());
+                if (sig == null) continue;
+                if (analyzed != null && CountDiff(sig, analyzed) > ChangeCount) pending = true;
+                int moving = prev == null ? 99 : CountDiff(sig, prev);
+                prev = sig;
+                if (!pending) continue;
+                if (moving < SettleCount) stable++; else stable = 0;
+                waited += 300;
+                if (stable < 2 && waited < 2500) continue;
+                double minGap = _noBoardStreak < 3 ? 1.2 : Math.Min(_noBoardStreak, 8);
+                if ((DateTime.UtcNow - lastRun).TotalSeconds < minGap) continue;
+                lastRun = DateTime.UtcNow;
+                pending = false; stable = 0; waited = 0;
+                var done = await AnalyzeOnce(manual: false);
+                if (done != null) analyzed = done; else pending = true;
+                prev = null;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { AppLog.Error("实时分析出错", ex); }
+    }
+
+    List<(int X0, int Y0, int X1, int Y1)> MaskRects()
+    {
+        var list = new List<(int X0, int Y0, int X1, int Y1)>();
+        int m = (int)(8 * _density);
+        if (_ballLp != null) list.Add((_ballLp.X - m, _ballLp.Y - m, _ballLp.X + _size + m, _ballLp.Y + _size + m));
+        if (_answer != null && _answerLp != null)
+        {
+            var (w, _, _) = ScreenGrabber.Metrics(this);
+            int aw = _answer.Width > 0 ? _answer.Width : (int)(w * 0.45);
+            int ah = _answer.Height > 0 ? _answer.Height : (int)(90 * _density);
+            int ax = (w - aw) / 2, ay = _answerLp.Y;
+            list.Add((ax - m, ay - m, ax + aw + m, ay + ah + m));
+        }
+        return list;
     }
 
     // ---------- the ball ----------
@@ -422,15 +594,23 @@ public class FloatingService : Service
         _ball = new TextView(this) { Text = "答", Gravity = GravityFlags.Center };
         _ball.TextSize = 18;
         _ball.SetTextColor(Color.White);
-        var bg = new GradientDrawable();
-        bg.SetShape(ShapeType.Oval);
-        bg.SetColor(Color.Argb(210, 30, 30, 30));
-        bg.SetStroke((int)(2 * _density), Color.Argb(255, 212, 175, 55));
-        _ball.Background = bg;
+        _ballBg = new GradientDrawable();
+        _ballBg.SetShape(ShapeType.Oval);
+        _ballBg.SetColor(Color.Argb(210, 30, 30, 30));
+        _ball.Background = _ballBg;
         _ball.Touch += (_, e) => e.Handled = OnBallTouch(e.Event!);
         _ballLp = new WindowManagerLayoutParams(_size, _size, WindowManagerTypes.ApplicationOverlay,
             WindowManagerFlags.NotFocusable | WindowManagerFlags.LayoutNoLimits, Format.Translucent)
         { Gravity = GravityFlags.Top | GravityFlags.Left };
+        UpdateBallLook();
+    }
+
+    /// <summary>Gold ring "答" when idle, green ring "实" in the live mode, "…" while analysing.</summary>
+    void UpdateBallLook()
+    {
+        if (_ball == null || _ballBg == null) return;
+        _ballBg.SetStroke((int)(2 * _density), _live ? Color.Argb(255, 80, 200, 120) : Color.Argb(255, 212, 175, 55));
+        _ball.Text = _busy ? "…" : _live ? "实" : "答";
     }
 
     void ShowBall(bool center)
@@ -523,28 +703,39 @@ public class FloatingService : Service
     {
         if (_tapPending)
         {
-            // a second tap: hide the ball (the notification brings it back)
+            // a second tap: hide the ball (the notification brings it back); the live mode waits meanwhile
             _handler.RemoveCallbacks(_singleTap);
             _tapPending = false;
             if (_ball != null) _ball.Visibility = ViewStates.Gone;
-            if (_answer != null) _answer.Visibility = ViewStates.Gone;
+            HideAnswer();
             return;
         }
         _tapPending = true;
         _handler.PostDelayed(_singleTap, 300);
     }
 
-    // ---------- tap: screenshot, solve, log, show ----------
-    async void OnSingleTap()
+    // ---------- analyse: screenshot, solve, log, show ----------
+    async void OnSingleTap() => await AnalyzeOnce(manual: true);
+
+    /// <summary>Returns the thumbnail of the analysed screen, or null when nothing was analysed.</summary>
+    async Task<byte[]?> AnalyzeOnce(bool manual)
     {
-        if (_busy) return;
+        if (_busy) return null;
         _busy = true;
         try
         {
-            if (_grabber == null) { AppLog.Error("没有截屏权限，请回到应用重新开启悬浮球"); ShowAnswer("截屏未授权"); return; }
-            if (!_ready || _engine == null) { ShowAnswer("模型准备中，稍等"); return; }
+            if (_grabber == null)
+            {
+                if (manual) { AppLog.Error("没有截屏权限，请回到应用重新开启悬浮球"); ShowAnswer("截屏未授权"); }
+                return null;
+            }
+            if (!_ready || _engine == null)
+            {
+                if (manual) ShowAnswer("模型准备中，稍等");
+                return null;
+            }
 
-            _ball!.Text = "…";
+            UpdateBallLook();
             Cloak(true);                       // the overlay would be in the screenshot (and in the OCR)
             _grabber.FollowScreenSize();
             long seq = _grabber.Seq;
@@ -552,24 +743,71 @@ public class FloatingService : Service
             await Task.Delay(200);
             while (_grabber.Seq < seq + 2 && sw.ElapsedMilliseconds < 1500) await Task.Delay(30);
             var frame = _grabber.Grab();
+            var sig = _grabber.Signature(MaskRects());
             Cloak(false);
 
-            if (frame == null) { AppLog.Error("截屏失败：没有拿到画面"); ShowAnswer("截屏失败"); return; }
+            if (frame == null)
+            {
+                if (manual) { AppLog.Error("截屏失败：没有拿到画面"); ShowAnswer("截屏失败"); }
+                return null;
+            }
 
-            string answer = await _engine.SolveAsync(frame);
-            AppLog.Answer(answer);
-            ShowAnswer(AppLog.LastAnswer() ?? answer);   // what the window shows is read from the log
+            string answer = await _engine.SolveAsync(frame, manual);
+            bool noBoard = answer == AnswerEngine.NoBoard;
+            _noBoardStreak = noBoard && !manual ? _noBoardStreak + 1 : 0;
+            if (noBoard)
+            {
+                if (manual || (DateTime.UtcNow - _lastShot).TotalSeconds > 60)
+                {
+                    _lastShot = DateTime.UtcNow;
+                    int fw = frame.Width, fh = frame.Height;
+                    byte[] fp = frame.Pixels;
+                    await Task.Run(() => SaveDebugImage(fw, fh, fp));   // to see what the scanner saw
+                }
+                if (manual) ShowAnswer(answer); else HideAnswer();
+            }
+            else
+            {
+                if (manual || answer != _lastAnswer) AppLog.Answer(answer);
+                _lastAnswer = answer;
+                ShowAnswer(AppLog.LastAnswer() ?? answer);   // what the window shows is read from the log
+            }
+            return sig;
         }
         catch (Exception ex)
         {
             AppLog.Error("分析出错", ex);
             Cloak(false);
-            ShowAnswer("出错了，详见 设置→报错日志");
+            if (manual) ShowAnswer("出错了，详见 设置→报错日志");
+            return null;
         }
         finally
         {
-            if (_ball != null) _ball.Text = "答";
             _busy = false;
+            UpdateBallLook();
+        }
+    }
+
+    /// <summary>The frame the scanner could not read goes to the gallery (Pictures/Tartarus).</summary>
+    void SaveDebugImage(int w, int h, byte[] rgba)
+    {
+        try
+        {
+            using var bmp = Bitmap.CreateBitmap(w, h, Bitmap.Config.Argb8888!)!;
+            bmp.CopyPixelsFromBuffer(Java.Nio.ByteBuffer.Wrap(rgba)!);
+            var values = new ContentValues();
+            values.Put("_display_name", $"tartarus_fail_{DateTime.Now:HHmmss}.jpg");
+            values.Put("mime_type", "image/jpeg");
+            values.Put("relative_path", "Pictures/Tartarus");
+            var uri = ContentResolver!.Insert(MediaStore.Images.Media.ExternalContentUri!, values);
+            if (uri == null) { AppLog.Error("保存失败截图：无法创建文件"); return; }
+            using var stream = ContentResolver.OpenOutputStream(uri)!;
+            bmp.Compress(Bitmap.CompressFormat.Jpeg!, 85, stream);
+            AppLog.Error($"[调试] 识别失败的那一帧已存到 相册/Tartarus ({w}x{h})");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("保存失败截图出错", ex);
         }
     }
 
@@ -579,6 +817,11 @@ public class FloatingService : Service
             _ball.Visibility = on ? ViewStates.Invisible : ViewStates.Visible;
         if (_answer != null && _answer.Visibility != ViewStates.Gone)
             _answer.Visibility = on ? ViewStates.Invisible : ViewStates.Visible;
+    }
+
+    void HideAnswer()
+    {
+        if (_answer != null) _answer.Visibility = ViewStates.Gone;
     }
 
     void ShowAnswer(string text)
@@ -594,7 +837,7 @@ public class FloatingService : Service
             bg.SetCornerRadius(14 * _density);
             bg.SetStroke((int)(2 * _density), Color.Argb(255, 212, 175, 55));
             _answer.Background = bg;
-            _answer.Click += (_, _) => _answer.Visibility = ViewStates.Gone;   // tap to dismiss
+            _answer.Click += (_, _) => HideAnswer();   // tap to dismiss
             _answerLp = new WindowManagerLayoutParams(ViewGroup.LayoutParams.WrapContent, ViewGroup.LayoutParams.WrapContent,
                 WindowManagerTypes.ApplicationOverlay, WindowManagerFlags.NotFocusable | WindowManagerFlags.LayoutNoLimits, Format.Translucent)
             { Gravity = GravityFlags.Top | GravityFlags.CenterHorizontal, Y = (int)(24 * _density) };
@@ -604,11 +847,13 @@ public class FloatingService : Service
         if (!_answerAdded) { _wm.AddView(_answer, _answerLp); _answerAdded = true; }
         else _wm.UpdateViewLayout(_answer, _answerLp);
         _handler.RemoveCallbacks(_hideAnswer);
-        _handler.PostDelayed(_hideAnswer, 10000);
+        if (!_live) _handler.PostDelayed(_hideAnswer, 10000);   // the live mode keeps the newest answer up
     }
 
     public override void OnDestroy()
     {
+        Running = false;
+        StopLive();
         try { if (_ballAdded) _wm.RemoveView(_ball); } catch { }
         try { if (_answerAdded) _wm.RemoveView(_answer); } catch { }
         _ballAdded = _answerAdded = false;

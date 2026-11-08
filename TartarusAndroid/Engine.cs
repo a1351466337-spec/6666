@@ -85,7 +85,12 @@ static class AppLog
 /// </summary>
 sealed class AnswerEngine : IDisposable
 {
-    readonly ScanService _scans = new(ocrThreads: 4);
+    public const string NoBoard = "未识别到棋盘（事件或弹窗请先点确认）";
+
+    ScanService _scans = new(ocrThreads: 4);
+    int _fails;
+    string? _pendingGuess;
+    readonly List<string> _guessed = [];
     readonly HintService _hints = new(playouts: 512, seconds: 2.0);
     EditableSandbox? _lastBoard;
     Tartarus.Vision.Ocr.ScreenText? _lastText;
@@ -97,7 +102,7 @@ sealed class AnswerEngine : IDisposable
 
     public Task WarmUpAsync() => _scans.WarmUpAsync();
 
-    public async Task<string> SolveAsync(Frame frame)
+    public async Task<string> SolveAsync(Frame frame, bool manual = true)
     {
         ScanResult r = await _scans.ScanAsync(frame);
         if (_scans.Problem is { } problem)
@@ -109,9 +114,16 @@ sealed class AnswerEngine : IDisposable
         bool red = LooksRed(frame);
         if (!r.Ok && r.Pick == null && !(red && _lastBoard != null))
         {
-            AppLog.Error($"没有识别到棋盘或选择界面 (原因: {r.Reason}; 截图 {frame.Width}x{frame.Height}; 红屏={red})");
-            return "未识别到棋盘";
+            if (manual)   // the live mode looks at every screen, other apps' too: no log, no reset for those
+            {
+                _fails++;
+                string notes = r.Notes is { } nn ? string.Join(" / ", nn) : "";
+                AppLog.Error($"没有识别到棋盘或选择界面 (原因: {r.Reason}; 截图 {frame.Width}x{frame.Height}; 红屏={red}; 缩放K={r.Layout?.K:0.000}; 连续失败={_fails}; 备注={notes})");
+                if (_fails % 3 == 0) ResetScanner();
+            }
+            return NoBoard;
         }
+        _fails = 0;
 
         Observation obs;
         bool consumeOnly = false;
@@ -132,6 +144,15 @@ sealed class AnswerEngine : IDisposable
             {
                 sb.Theme ??= r.ThemeIcon;
             }
+            // The instrument icons are not always all read: the ones recommended at each pick stand in for missing ones.
+            if (!consumeOnly && _pendingGuess != null)
+            {
+                _guessed.Add(_pendingGuess);
+                _pendingGuess = null;
+            }
+            if (_guessed.Count > sb.Instruments.Count)
+                foreach (string g in _guessed)
+                    if (sb.Instruments.Count < _guessed.Count && !sb.Instruments.Contains(g)) sb.Instruments.Add(g);
             sb.MarksByInstruments();
             var text = consumeOnly ? _lastText ?? r.Text : r.Text;
             obs = GameObservation.From(sb, text);
@@ -164,6 +185,8 @@ sealed class AnswerEngine : IDisposable
                 string? theme = _lastBoard?.Theme;
                 under = EditableSandbox.Empty();
                 under.Theme = theme;
+                _guessed.Clear();      // a new run
+                _pendingGuess = null;
             }
             obs = GameObservation.FromPick(pick, under, _lastText);
         }
@@ -188,6 +211,8 @@ sealed class AnswerEngine : IDisposable
             var done = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(_hints.Seconds + 8)));
             if (done != tcs.Task) return "没有算出建议";
             var hint = tcs.Task.Result;
+            if (pick?.Kind == PickRead.Instrument && hint.Ranked.Count > 0 && hint.Ranked[0].Action.Kind == ActionKind.PickInstrument)
+                _pendingGuess = GameData.Info((Instrument)hint.Ranked[0].Action.Arg).Id;
             AppLog.Error("[调试] 排名: " + string.Join(" | ", hint.Ranked.Take(5).Select(a => $"{Step(a.Action, hint, pick)}={a.Mean:0.00}")));
             return Describe(hint, pick);
         }
@@ -195,6 +220,17 @@ sealed class AnswerEngine : IDisposable
         {
             _hints.Ready -= OnReady;
         }
+    }
+
+    /// <summary>A fresh scanner forgets the scale and layout it settled on (after a game restart, say).</summary>
+    void ResetScanner()
+    {
+        var old = _scans;
+        _scans = new ScanService(ocrThreads: 4);
+        _scans.SetGameLanguage("zh");
+        old.Dispose();
+        _ = _scans.WarmUpAsync();
+        AppLog.Error("[调试] 连续识别失败，已重置识别器");
     }
 
     /// <summary>Strong red at both sides of the screen: the Consume target pick's glow.</summary>
@@ -228,7 +264,7 @@ sealed class AnswerEngine : IDisposable
             return $"{i + 1}:{c.Kind.ToString()[0]}" + (c.Kind == ObservedKind.Inmate ? $"{c.Code.ToString()[0]}{(int)c.Rarity}" : "");
         }));
         return $"ok={r.Ok} pick={r.Pick?.Kind} red={red} consumeOnly={consumeOnly} days={obs.RemainingDays} warden={obs.Warden} " +
-               $"chroma={obs.Chromatic} inst={obs.Instruments.Count} dest={obs.Destinations.Count} interro={obs.Interrogation} " +
+               $"chroma={obs.Chromatic} inst={string.Join(",", obs.Instruments)} dest={obs.Destinations.Count} interro={obs.Interrogation} " +
                $"decUsed={obs.DecisionUsed} repUsed={obs.ReplaceUsed} title={r.Text?.Title} banner={banner} cards={cards} cells={cells}";
     }
 
